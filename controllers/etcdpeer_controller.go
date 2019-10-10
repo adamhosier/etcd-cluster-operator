@@ -25,16 +25,16 @@ type EtcdPeerReconciler struct {
 }
 
 const (
-	etcdImage                     = "quay.io/coreos/etcd:v3.2.27"
-	etcdAdvertiseClientURLsEnvVar = "ETCD_ADVERTISE_CLIENT_URLS"
-	etcdInitialClusterEnvVar      = "ETCD_INITIAL_CLUSTER"
-	etcdNameEnvVar                = "ETCD_NAME"
-	etcdScheme                    = "http"
-	etcdPeerPort                  = 2380
-	appName                       = "etcd"
-	appLabel                      = "app.kubernetes.io/app"
-	clusterLabel                  = "etcd.improbable.io/cluster-name"
-	peerLabel                     = "etcd.improbable.io/peer-name"
+	etcdImage                   = "quay.io/coreos/etcd:v3.2.27"
+	etcdAdvertisePeerURLsEnvVar = "ETCD_ADVERTISE_PEER_URLS"
+	etcdInitialClusterEnvVar    = "ETCD_INITIAL_CLUSTER"
+	etcdNameEnvVar              = "ETCD_NAME"
+	etcdScheme                  = "http"
+	etcdPeerPort                = 2380
+	appName                     = "etcd"
+	appLabel                    = "app.kubernetes.io/app"
+	clusterLabel                = "etcd.improbable.io/cluster-name"
+	peerLabel                   = "etcd.improbable.io/peer-name"
 )
 
 // +kubebuilder:rbac:groups=etcd.improbable.io,resources=etcdpeers,verbs=get;list;watch;create;update;patch;delete
@@ -69,8 +69,8 @@ func advertiseURL(etcdPeer etcdv1alpha1.EtcdPeer) *url.URL {
 		Host: fmt.Sprintf(
 			"%s.%s.%s.svc:2380",
 			etcdPeer.Name,
-			etcdPeer.Namespace,
 			etcdPeer.Spec.ClusterName,
+			etcdPeer.Namespace,
 		),
 	}
 }
@@ -122,7 +122,7 @@ func defineReplicaSet(peer etcdv1alpha1.EtcdPeer) appsv1.ReplicaSet {
 									Value: peer.Name,
 								},
 								{
-									Name:  etcdAdvertiseClientURLsEnvVar,
+									Name:  etcdAdvertisePeerURLsEnvVar,
 									Value: advertiseURL(peer).String(),
 								},
 							},
