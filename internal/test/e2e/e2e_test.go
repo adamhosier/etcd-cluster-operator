@@ -1,26 +1,44 @@
 package e2e
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	etcdv1alpha1 "github.com/improbable-eng/etcd-cluster-operator/api/v1alpha1"
-	"github.com/improbable-eng/etcd-cluster-operator/controllers"
+	"github.com/improbable-eng/etcd-cluster-operator/internal/test/try"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/clientcmd"
+	etcd "go.etcd.io/etcd/client"
+	"io/ioutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"os"
 	"os/exec"
 	"path/filepath"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kindv1alpha3 "sigs.k8s.io/kind/pkg/apis/config/v1alpha3"
+	"sigs.k8s.io/kind/pkg/cluster"
+	"sigs.k8s.io/kind/pkg/cluster/create"
+	"sigs.k8s.io/kind/pkg/container/cri"
+	"strings"
 	"testing"
 	"time"
 )
 
+const (
+	expectedClusterSize = 3
+)
+
 var (
-	fUseKind = flag.Bool("kind", false, "Creates a Kind cluster to run the tests against")
+	fUseKind           = flag.Bool("kind", false, "Creates a Kind cluster to run the tests against")
 	fUseCurrentContext = flag.Bool("current-context", false, "Runs the tests against the current kubernetes context, the path to kube config defaults to ~/.kube/config, unless overridden by the KUBECONFIG environment variable")
-	fRepoRoot = flag.String("repo-root", "", "The absolute path to the root of the etcd-cluster-operator git repository.")
+	fRepoRoot          = flag.String("repo-root", "", "The absolute path to the root of the etcd-cluster-operator git repository.")
+	fCleanup           = flag.Bool("cleanup", true, "Tears down the Kind cluster once the test is finished.")
+
+	etcdConfig = etcd.Config{
+		Endpoints: []string{"http://127.0.0.1:2379"},
+		Transport: etcd.DefaultTransport,
+		// set timeout per request to fail fast when the target endpoint is unavailable
+		HeaderTimeoutPerRequest: time.Second,
+	}
 )
 
 func TestE2E_Kind(t *testing.T) {
@@ -28,17 +46,66 @@ func TestE2E_Kind(t *testing.T) {
 		t.Skip()
 	}
 
-	tag := fmt.Sprint(time.Now().Nanosecond())
+	// Tag for running this test, for naming resources.
+	operatorImage := "etcd-operator:test"
 
-	k8sConfig, _, err := setupLocalCluster(tag)
-	require.NoError(t, err, "failed to set up the local Kind cluster")
+	// Create Kind cluster to run the workloads.
+	kind, stopKind := setupLocalCluster(t)
+	defer stopKind()
 
-	err = etcdv1alpha1.AddToScheme(scheme.Scheme)
+	kubectl := &kubectlContext{
+		t:          t,
+		configPath: kind.KubeConfigPath(),
+	}
+
+	// Ensure CRDs exist in the cluster.
+	t.Log("Applying CRDs")
+	kubectl.Apply("--kustomize", filepath.Join(*fRepoRoot, "config", "crd"))
+
+	// Build the operator.
+	t.Log("Building operator image")
+	out, err := exec.Command("docker", "build", "-t", operatorImage, *fRepoRoot).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	// Bundle the image to a tar.
+	tmpDir, err := ioutil.TempDir("", "etcd-operator-e2e-test")
 	require.NoError(t, err)
-	k8sClient, err := client.New(k8sConfig, client.Options{Scheme: scheme.Scheme})
+	imageTar := filepath.Join(tmpDir, "etcd-operator.tar")
+
+	out, err = exec.Command("docker", "save", "-o", imageTar, operatorImage).CombinedOutput()
+	require.NoError(t, err, string(out))
+	imageFile, err := os.Open(imageTar)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, imageFile.Close(), "failed to close operator image tar")
+	}()
+
+	// Load the built image into the Kind cluster.
+	t.Log("Loading image in to Kind cluster")
+	nodes, err := kind.ListInternalNodes()
+	require.NoError(t, err)
+	for _, node := range nodes {
+		err := node.LoadImageArchive(imageFile)
+		require.NoError(t, err)
+	}
+
+	// Deploy the image, and ensure it starts.
+	t.Log("Applying operator")
+	kubectl.Apply("-f", filepath.Join(*fRepoRoot, "examples", "operator.yaml"))
+	err = try.Eventually(func() error {
+		out, err := kubectl.Get("deploy", "etcd-operator", "-o=jsonpath='{.status.readyReplicas}'")
+		if err != nil {
+			return err
+		}
+		if out != "'1'" {
+			return errors.New("expected at least 1 replica of the operator to be available, got: " + out)
+		}
+		return nil
+	}, time.Minute, time.Second*5)
 	require.NoError(t, err)
 
-	runAllTests(t, k8sClient)
+	t.Log("Running tests")
+	runAllTests(t, kubectl)
 }
 
 func TestE2E_CurrentContext(t *testing.T) {
@@ -53,48 +120,96 @@ func TestE2E_CurrentContext(t *testing.T) {
 		configPath = path
 	}
 
-	k8sConfig, err := clientcmd.BuildConfigFromFlags("", configPath)
-	require.NoError(t, err)
+	kubectl := kubectlContext{
+		t:          t,
+		configPath: configPath,
+	}
 
-	err = etcdv1alpha1.AddToScheme(scheme.Scheme)
-	require.NoError(t, err)
-	k8sClient, err := client.New(k8sConfig, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-
-	runAllTests(t, k8sClient)
+	// TODO run tests call
+	_ = kubectl
 }
 
-func runAllTests(t *testing.T, k8sClient client.Client) {
-	kubectl(t, "apply", "--wait", "--kustomize", filepath.Join(*fRepoRoot, "config", "crd"))
+// Starts a Kind cluster on the local machine, exposing port 2379 accepting ETCD connections.
+func setupLocalCluster(t *testing.T) (*cluster.Context, func()) {
+	t.Log("Starting Kind cluster")
+	kind := cluster.NewContext("etcd-e2e")
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme.Scheme,
-		Port:               9443,
-	})
+	err := kind.Create(create.WithV1Alpha3(&kindv1alpha3.Cluster{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Cluster",
+			APIVersion: "kind.sigs.k8s.io/v1alpha3",
+		},
+		Nodes: []kindv1alpha3.Node{
+			{
+				Role: "control-plane",
+				ExtraPortMappings: []cri.PortMapping{
+					{
+						ContainerPort: 32379,
+						HostPort:      2379,
+					},
+				},
+			},
+		},
+	}))
 	require.NoError(t, err)
 
-	err = (&controllers.EtcdPeerReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("EtcdPeer"),
-	}).SetupWithManager(mgr)
-	require.NoError(t, err)
+	tearDown := func() {
+		if !*fCleanup {
+			return
+		}
+		t.Log("Stopping Kind cluster")
+		err := kind.Delete()
+		assert.NoError(t, err, "failed to stop Kind cluster")
+	}
 
-	// Add new resources here.
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	go func() {
-		err := mgr.Start(stopCh)
-		require.NoError(t, err)
-	}()
-
-	kubectl(t, "apply", "-f",  filepath.Join(*fRepoRoot, "examples", "cluster.yaml"))
-
-	time.Sleep(time.Minute)
+	return kind, tearDown
 }
 
-func kubectl(t *testing.T, args ...string) {
+func runAllTests(t *testing.T, kubectl *kubectlContext) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
+	defer cancel()
+
+	// Deploy the cluster custom resources.
+	kubectl.Apply("-f", filepath.Join(*fRepoRoot, "examples", "cluster.yaml"))
+
+	etcdClient, err := etcd.New(etcdConfig)
+	require.NoError(t, err)
+
+	err = try.Eventually(func() error {
+		t.Log("Checking if ETCD is available")
+		members, err := etcd.NewMembersAPI(etcdClient).List(ctx)
+		if err != nil {
+			return err
+		}
+
+		if len(members) != expectedClusterSize {
+			return errors.New(fmt.Sprintf("expected %d etcd peers, got %d", expectedClusterSize, len(members)))
+		}
+		return nil
+	}, time.Minute*2, time.Second*10)
+	require.NoError(t, err)
+	t.Log("ETCD is reachable from host machine")
+}
+
+type kubectlContext struct {
+	t          *testing.T
+	configPath string
+}
+
+func (k *kubectlContext) do(args ...string) ([]byte, error) {
+	k.t.Log("Running kubectl " + strings.Join(args, " "))
 	cmd := exec.Command("kubectl", args...)
-	out, err := cmd.CombinedOutput()
-	require.NoErrorf(t, err, "received error: %s", string(out))
+	cmd.Env = append(cmd.Env, "KUBECONFIG="+k.configPath)
+	return cmd.CombinedOutput()
+}
+
+func (k *kubectlContext) Apply(args ...string) {
+	out, err := k.do(append([]string{"apply"}, args...)...)
+	require.NoError(k.t, err, string(out))
+	k.t.Log(string(out))
+}
+
+func (k *kubectlContext) Get(args ...string) (string, error) {
+	out, err := k.do(append([]string{"get"}, args...)...)
+	return string(out), err
 }

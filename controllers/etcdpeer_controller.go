@@ -25,16 +25,18 @@ type EtcdPeerReconciler struct {
 }
 
 const (
-	etcdImage                   = "quay.io/coreos/etcd:v3.2.27"
-	etcdAdvertisePeerURLsEnvVar = "ETCD_INITIAL_ADVERTISE_PEER_URLS"
-	etcdInitialClusterEnvVar    = "ETCD_INITIAL_CLUSTER"
-	etcdNameEnvVar              = "ETCD_NAME"
-	etcdScheme                  = "http"
-	etcdPeerPort                = 2380
-	appName                     = "etcd"
-	appLabel                    = "app.kubernetes.io/name"
-	clusterLabel                = "etcd.improbable.io/cluster-name"
-	peerLabel                   = "etcd.improbable.io/peer-name"
+	etcdImage                     = "quay.io/coreos/etcd:v3.2.27"
+	etcdAdvertisePeerURLsEnvVar   = "ETCD_INITIAL_ADVERTISE_PEER_URLS"
+	etcdAdvertiseClientURLsEnvVar = "ETCD_ADVERTISE_CLIENT_URLS"
+	etcdInitialClusterEnvVar      = "ETCD_INITIAL_CLUSTER"
+	etcdNameEnvVar                = "ETCD_NAME"
+	etcdScheme                    = "http"
+	etcdClientPort                = 2379
+	etcdPeerPort                  = 2380
+	appName                       = "etcd"
+	appLabel                      = "app.kubernetes.io/name"
+	clusterLabel                  = "etcd.improbable.io/cluster-name"
+	peerLabel                     = "etcd.improbable.io/peer-name"
 )
 
 // +kubebuilder:rbac:groups=etcd.improbable.io,resources=etcdpeers,verbs=get;list;watch;create;update;patch;delete
@@ -63,14 +65,15 @@ func staticBootstrapInitialCluster(static etcdv1alpha1.StaticBootstrap) string {
 
 // advertiseURL builds the canonical URL of this peer from it's name and the
 // cluster name.
-func advertiseURL(etcdPeer etcdv1alpha1.EtcdPeer) *url.URL {
+func advertiseURL(etcdPeer etcdv1alpha1.EtcdPeer, port int32) *url.URL {
 	return &url.URL{
 		Scheme: "http",
 		Host: fmt.Sprintf(
-			"%s.%s.%s.svc:2380",
+			"%s.%s.%s.svc:%d",
 			etcdPeer.Name,
 			etcdPeer.Spec.ClusterName,
 			etcdPeer.Namespace,
+			port,
 		),
 	}
 }
@@ -123,7 +126,33 @@ func defineReplicaSet(peer etcdv1alpha1.EtcdPeer) appsv1.ReplicaSet {
 								},
 								{
 									Name:  etcdAdvertisePeerURLsEnvVar,
-									Value: advertiseURL(peer).String(),
+									Value: advertiseURL(peer, etcdPeerPort).String(),
+								},
+								{
+									Name:  etcdAdvertiseClientURLsEnvVar,
+									Value: advertiseURL(peer, etcdClientPort).String(),
+								},
+								{
+									Name:  "ETCD_LISTEN_PEER_URLS",
+									Value: "http://0.0.0.0:2380",
+								},
+								{
+									Name:  "ETCD_LISTEN_CLIENT_URLS",
+									Value: "http://0.0.0.0:2379",
+								},
+								{
+									Name:  "ETCD_INITIAL_CLUSTER_STATE",
+									Value: "new",
+								},
+							},
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          "client",
+									ContainerPort: etcdClientPort,
+								},
+								{
+									Name:          "peer",
+									ContainerPort: etcdPeerPort,
 								},
 							},
 						},
