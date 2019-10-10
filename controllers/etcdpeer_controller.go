@@ -26,13 +26,13 @@ type EtcdPeerReconciler struct {
 
 const (
 	etcdImage                   = "quay.io/coreos/etcd:v3.2.27"
-	etcdAdvertisePeerURLsEnvVar = "ETCD_ADVERTISE_PEER_URLS"
+	etcdAdvertisePeerURLsEnvVar = "ETCD_INITIAL_ADVERTISE_PEER_URLS"
 	etcdInitialClusterEnvVar    = "ETCD_INITIAL_CLUSTER"
 	etcdNameEnvVar              = "ETCD_NAME"
 	etcdScheme                  = "http"
 	etcdPeerPort                = 2380
 	appName                     = "etcd"
-	appLabel                    = "app.kubernetes.io/app"
+	appLabel                    = "app.kubernetes.io/name"
 	clusterLabel                = "etcd.improbable.io/cluster-name"
 	peerLabel                   = "etcd.improbable.io/peer-name"
 )
